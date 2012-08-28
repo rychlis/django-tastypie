@@ -2028,6 +2028,9 @@ class ModelResource(Resource):
             if getattr(field_object, 'is_m2m', False):
                 continue
 
+            if getattr(field_object, 'readonly', False):
+                continue
+
             if not field_object.attribute:
                 continue
 
