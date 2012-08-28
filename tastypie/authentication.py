@@ -231,7 +231,7 @@ class SessionAuthentication(Authentication):
     Relies on the user being logged in through the standard Django login
     setup.
 
-    Requires a valid CSRF token.
+    Requires a valid CSRF token sent in header as settings.CSRF_META_NAME (default 'HTTP_X_CSRFTOKEN')
     """
     def is_authenticated(self, request, **kwargs):
         """
@@ -261,7 +261,8 @@ class SessionAuthentication(Authentication):
             if not same_origin(referer, good_referer):
                 return False
 
-        request_csrf_token = request.META.get('HTTP_X_CSRFTOKEN', '')
+        csrf_meta_name = getattr(settings, 'CSRF_META_NAME', 'HTTP_X_CSRFTOKEN')
+        request_csrf_token = request.META.get(csrf_meta_name, '')
 
         if not constant_time_compare(request_csrf_token, csrf_token):
             return False
