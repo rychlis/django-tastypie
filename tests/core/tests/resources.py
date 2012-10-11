@@ -25,7 +25,7 @@ from tastypie.serializers import Serializer
 from tastypie.throttle import CacheThrottle
 from tastypie.utils import aware_datetime, make_naive, now
 from tastypie.validation import Validation, FormValidation
-from core.models import Note, NoteWithEditor, Subject, MediaBit, AutoNowNote
+from core.models import Note, NoteWithEditor, Subject, MediaBit, AutoNowNote, DateRecord, Counter
 from core.tests.mocks import MockRequest
 from core.utils import SimpleHandler
 
@@ -670,6 +670,19 @@ class ResourceTestCase(TestCase):
 # Model-based tests...
 # ====================
 
+class DateRecordResource(ModelResource):
+    class Meta:
+        queryset = DateRecord.objects.all()
+        always_return_data = True
+
+    def hydrate(self, bundle):
+        bundle.data['message'] = bundle.data['message'].lower()
+        return bundle
+
+    def hydrate_username(self, bundle):
+        bundle.data['username'] = bundle.data['username'].upper()
+        return bundle
+
 
 class NoteResource(ModelResource):
     class Meta:
@@ -1021,6 +1034,19 @@ class PerObjectNoteResource(NoteResource):
         self._post_limits = len(object_list._result_cache)
         return new_object_list
 # End per object authorization bits.
+
+
+class CounterResource(ModelResource):
+    count = fields.IntegerField('count', default=0, null=True)
+
+    class Meta:
+        queryset = Counter.objects.all()
+
+    def full_hydrate(self, bundle):
+        bundle.times_hydrated = getattr(bundle, 'times_hydrated', 0) + 1
+        new_shiny = super(CounterResource, self).full_hydrate(bundle)
+        new_shiny.obj.count = new_shiny.times_hydrated
+        return new_shiny
 
 
 class ModelResourceTestCase(TestCase):
@@ -1768,6 +1794,40 @@ class ModelResourceTestCase(TestCase):
         self.assertEqual(Note.objects.count(), 7)
         new_note = Note.objects.get(slug='cat-is-back')
         self.assertEqual(new_note.author, None)
+
+    def test_put_detail_with_identifiers(self):
+        request = MockRequest()
+        request.GET = {'format': 'json'}
+        request.method = 'PUT'
+        request.raw_post_data = '{"date": "2012-09-07", "username": "WAT", "message": "hello"}'
+        date_record_resource = DateRecordResource()
+        resp = date_record_resource.put_detail(request, username="maraujop")
+
+        self.assertEqual(resp.status_code, 202)
+        data = json.loads(resp.content)
+        self.assertEqual(data['username'], "MARAUJOP")
+
+        request = MockRequest()
+        request.GET = {'format': 'json'}
+        request.method = 'PUT'
+        request.raw_post_data = '{"date": "WAT", "username": "maraujop", "message": "hello"}'
+        date_record_resource = DateRecordResource()
+        resp = date_record_resource.put_detail(request, date="2012-09-07")
+
+        self.assertEqual(resp.status_code, 202)
+        data = json.loads(resp.content)
+        self.assertEqual(data['date'], "2012-09-07T00:00:00")
+
+        request = MockRequest()
+        request.GET = {'format': 'json'}
+        request.method = 'PUT'
+        request.raw_post_data = '{"date": "2012-09-07", "username": "maraujop", "message": "WAT"}'
+        date_record_resource = DateRecordResource()
+        resp = date_record_resource.put_detail(request, message="HELLO")
+
+        self.assertEqual(resp.status_code, 202)
+        data = json.loads(resp.content)
+        self.assertEqual(data['message'], "hello")
 
     def test_post_list(self):
         self.assertEqual(Note.objects.count(), 6)
@@ -2582,6 +2642,20 @@ class ModelResourceTestCase(TestCase):
         self.assertEqual(numero_uno.is_active, True)
         self.assertEqual(numero_uno.author.pk, request.user.pk)
 
+    def test_obj_update_single_hydrate(self):
+        counter = Counter.objects.get(pk=1)
+        self.assertEqual(counter.count, 1)
+        cr = CounterResource()
+        counter_bundle = cr.build_bundle(data={
+            "pk": counter.pk,
+            "name": "Signups",
+            "slug": "signups",
+        })
+        cr.obj_update(counter_bundle, pk=1)
+        self.assertEqual(Counter.objects.all().count(), 2)
+        counter = Counter.objects.get(pk=1)
+        self.assertEqual(counter.count, 1)
+
     def test_obj_delete(self):
         self.assertEqual(Note.objects.all().count(), 6)
         note = NoteResource()
@@ -2903,7 +2977,8 @@ class ModelResourceTestCase(TestCase):
         # resp = resource.get_detail(request, pk=1)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.content, '{"content": "This is my very first post using my shiny new API. Pretty sweet, huh?", "created": "2010-03-30T20:05:00", "id": 1, "is_active": true, "resource_uri": "/api/v1/notes/1/", "slug": "first-post", "title": "First Post!", "updated": "2010-03-30T20:05:00"}')
-        self.assertFalse(resp.has_header('Cache-Control'))
+        self.assertTrue(resp.has_header('Cache-Control'))
+        self.assertEqual(resp._headers['cache-control'], ('Cache-Control', 'no-cache'))
 
         # Now as Ajax.
         request.META = {'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest'}
@@ -2948,6 +3023,40 @@ class ModelResourceTestCase(TestCase):
         })
         hydrated_2 = rornr.full_hydrate(hbundle_2)
         self.assertEqual(hydrated_2.obj.author.username, 'johndoe')
+
+    def test_readonly_save_related(self):
+        rornr = ReadOnlyRelatedNoteResource()
+        note = Note.objects.get(pk=1)
+        dbundle = Bundle(obj=note)
+
+        # Make sure the field is there on read.
+        dehydrated = rornr.full_dehydrate(dbundle)
+        self.assertTrue('author' in dehydrated.data)
+
+        # Fetch the bundle
+        hbundle = Bundle(obj=note, data={
+            'name': 'Daniel',
+            'view_count': 6,
+            'date_joined': aware_datetime(2010, 2, 15, 12, 0, 0),
+            'author': '/api/v1/users/2/',
+        })
+        hydrated = rornr.full_hydrate(hbundle)
+
+        # Get the related object.
+        related_obj = getattr(hydrated.obj, "author")
+
+        # Monkey Patch save to raise an exception
+        def fake_save(*args, **kwargs):
+            raise Exception("save() called in a readonly field")
+
+        _real_save = related_obj.save
+
+        try:
+            related_obj.save = fake_save
+
+            rornr.save_related(hydrated)
+        finally:
+            related_obj.save = _real_save
 
 
 class BasicAuthResourceTestCase(TestCase):

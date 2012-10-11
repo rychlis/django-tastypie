@@ -7,9 +7,9 @@ from django.conf.urls.defaults import patterns, url
 from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned, ValidationError
 from django.core.urlresolvers import NoReverseMatch, reverse, resolve, Resolver404, get_script_prefix
 from django.db import transaction
-from django.db.models.sql.constants import QUERY_TERMS, LOOKUP_SEP
+from django.db.models.sql.constants import QUERY_TERMS
 from django.http import HttpResponse, HttpResponseNotFound, Http404
-from django.utils.cache import patch_cache_control
+from django.utils.cache import patch_cache_control, patch_vary_headers
 from tastypie.authentication import Authentication
 from tastypie.authorization import ReadOnlyAuthorization
 from tastypie.bundle import Bundle
@@ -40,6 +40,12 @@ try:
 except ImportError:
     def csrf_exempt(func):
         return func
+
+# Django 1.5 has moved this constant up one level.
+try:
+    from django.db.models.constants import LOOKUP_SEP
+except ImportError:
+    from django.db.models.sql.constants import LOOKUP_SEP
 
 
 class NOT_AVAILABLE:
@@ -194,6 +200,20 @@ class Resource(object):
             try:
                 callback = getattr(self, view)
                 response = callback(request, *args, **kwargs)
+
+                # Our response can vary based on a number of factors, use
+                # the cache class to determine what we should ``Vary`` on so
+                # caches won't return the wrong (cached) version.
+                varies = getattr(self._meta.cache, "varies", [])
+
+                if varies:
+                    patch_vary_headers(response, varies)
+
+                if self._meta.cache.cacheable(request, response):
+                    if self._meta.cache.cache_control():
+                        # If the request is cacheable and we have a
+                        # ``Cache-Control`` available then patch the header.
+                        patch_cache_control(response, **self._meta.cache.cache_control())
 
                 if request.is_ajax() and not response.has_header("Cache-Control"):
                     # IE excessively caches XMLHttpRequests, so we're disabling
@@ -1907,26 +1927,52 @@ class ModelResource(Resource):
         self.save_m2m(m2m_bundle)
         return bundle
 
+    def lookup_kwargs_with_identifiers(self, bundle, kwargs):
+        """
+        Kwargs here represent uri identifiers Ex: /repos/<user_id>/<repo_name>/
+        We need to turn those identifiers into Python objects for generating
+        lookup parameters that can find them in the DB
+        """
+        lookup_kwargs = {}
+        bundle.obj = self.get_object_list(bundle.request).model()
+        # Override data values, we rely on uri identifiers
+        bundle.data.update(kwargs)
+        # We're going to manually hydrate, as opposed to calling
+        # ``full_hydrate``, to ensure we don't try to flesh out related
+        # resources & keep things speedy.
+        bundle = self.hydrate(bundle)
+
+        for identifier in kwargs:
+            if identifier == self._meta.detail_uri_name:
+                lookup_kwargs[identifier] = kwargs[identifier]
+                continue
+
+            field_object = self.fields[identifier]
+
+            # Skip readonly or related fields.
+            if field_object.readonly is True or getattr(field_object, 'is_related', False):
+                continue
+
+            # Check for an optional method to do further hydration.
+            method = getattr(self, "hydrate_%s" % identifier, None)
+
+            if method:
+                bundle = method(bundle)
+
+            if field_object.attribute:
+                value = field_object.hydrate(bundle)
+
+            lookup_kwargs[identifier] = value
+
+        return lookup_kwargs
+
     def obj_update(self, bundle, request=None, skip_errors=False, **kwargs):
         """
         A ORM-specific implementation of ``obj_update``.
         """
         if not bundle.obj or not self.get_bundle_detail_data(bundle):
-            # Attempt to hydrate data from kwargs before doing a lookup for the object.
-            # This step is needed so certain values (like datetime) will pass model validation.
             try:
-                bundle.obj = self.get_object_list(bundle.request).model()
-                bundle.data.update(kwargs)
-                bundle = self.full_hydrate(bundle)
-                lookup_kwargs = kwargs.copy()
-
-                for key in kwargs.keys():
-                    if key == self._meta.detail_uri_name:
-                        continue
-                    elif getattr(bundle.obj, key, NOT_AVAILABLE) is not NOT_AVAILABLE:
-                        lookup_kwargs[key] = getattr(bundle.obj, key)
-                    else:
-                        del lookup_kwargs[key]
+                lookup_kwargs = self.lookup_kwargs_with_identifiers(bundle, kwargs)
             except:
                 # if there is trouble hydrating the data, fall back to just
                 # using kwargs by itself (usually it only contains a "pk" key
@@ -2032,6 +2078,9 @@ class ModelResource(Resource):
                 continue
 
             if not field_object.attribute:
+                continue
+
+            if field_object.readonly:
                 continue
 
             if field_object.blank and not bundle.data.has_key(field_name):
